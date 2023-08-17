@@ -1,0 +1,98 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyArgumentListInspection" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="PyAttributeOutsideInitInspection" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
+    <inspection_tool class="PyChainedComparisonsInspection" enabled="true" level="WEAK WARNING" enabled_by_default="true">
+      <option name="ignoreConstantInTheMiddle" value="true" />
+    </inspection_tool>
+    <inspection_tool class="PyCompatibilityInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ourVersions">
+        <value>
+          <list size="1">
+            <item index="0" class="java.lang.String" itemvalue="3.10" />
+          </list>
+        </value>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyDictCreationInspection" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
+    <inspection_tool class="PyDictDuplicateKeysInspection" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="PyDocstringTypesInspection" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
+    <inspection_tool class="PyExceptionInheritInspection" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="PyIncorrectDocstringInspection" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
+    <inspection_tool class="PyMethodOverridingInspection" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="PyNestedDecoratorsInspection" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
+    <inspection_tool class="PyOldStyleClassesInspection" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <value>
+          <list size="23">
+            <item index="0" class="java.lang.String" itemvalue="tqdm" />
+            <item index="1" class="java.lang.String" itemvalue="matplotlib" />
+            <item index="2" class="java.lang.String" itemvalue="torch" />
+            <item index="3" class="java.lang.String" itemvalue="numpy" />
+            <item index="4" class="java.lang.String" itemvalue="torchvision" />
+            <item index="5" class="java.lang.String" itemvalue="Pillow" />
+            <item index="6" class="java.lang.String" itemvalue="future" />
+            <item index="7" class="java.lang.String" itemvalue="yapf" />
+            <item index="8" class="java.lang.String" itemvalue="isort" />
+            <item index="9" class="java.lang.String" itemvalue="flake8" />
+            <item index="10" class="java.lang.String" itemvalue="wget" />
+            <item index="11" class="java.lang.String" itemvalue="pytorch-lightning" />
+            <item index="12" class="java.lang.String" itemvalue="torchmetrics" />
+            <item index="13" class="java.lang.String" itemvalue="timm" />
+            <item index="14" class="java.lang.String" itemvalue="wandb" />
+            <item index="15" class="java.lang.String" itemvalue="lightning-bolts" />
+            <item index="16" class="java.lang.String" itemvalue="einops" />
+            <item index="17" class="java.lang.String" itemvalue="ftfy" />
+            <item index="18" class="java.lang.String" itemvalue="tables" />
+            <item index="19" class="java.lang.String" itemvalue="ml-collections" />
+            <item index="20" class="java.lang.String" itemvalue="python-lmdb" />
+            <item index="21" class="java.lang.String" itemvalue="pytorch" />
+            <item index="22" class="java.lang.String" itemvalue="addict" />
+          </list>
+        </value>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyPep8Inspection" enabled="true" level="WEAK WARNING" enabled_by_default="true">
+      <option name="ignoredErrors">
+        <list>
+          <option value="E266" />
+          <option value="E265" />
+          <option value="E402" />
+          <option value="E302" />
+          <option value="E101" />
+          <option value="E116" />
+          <option value="E722" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyPep8NamingInspection" enabled="true" level="WEAK WARNING" enabled_by_default="true">
+      <option name="ignoredErrors">
+        <list>
+          <option value="N802" />
+          <option value="N806" />
+          <option value="N803" />
+          <option value="N801" />
+          <option value="N812" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyTypeCheckerInspection" enabled="true" level="WEAK WARNING" enabled_by_default="true" />
+    <inspection_tool class="PyUnresolvedReferencesInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredIdentifiers">
+        <list>
+          <option value="torch.nn.functional" />
+          <option value="int.backward" />
+          <option value="torch.cuda.FloatTensor" />
+          <option value="object.transform" />
+          <option value="autograd.numpy.dot" />
+          <option value="autograd.numpy.log" />
+          <option value="autograd.numpy.ndarray" />
+          <option value="int.unsqueeze" />
+          <option value="torch.backends.cuda" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
