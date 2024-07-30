@@ -1,2 +1,2 @@
 # BAM
- balanced-attention-matching for unsupervised pretraining
+Balanced-Attention-Matching Loss for self-supervised pretraining
