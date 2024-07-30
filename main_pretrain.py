@@ -1,76 +1,76 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import argparse
+import logging
 import os
-import sys
 import datetime
+from pathlib import Path
 import time
-import math
 import json
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
-from pathlib import Path
+from timm.loss import SoftTargetCrossEntropy, LabelSmoothingCrossEntropy
+from torchvision.datasets import ImageFolder
+from torchvision.transforms import transforms
 
 import utils
-from bam import BAMLoss
-from online_evaluation import knn_loaders, knn
-from vision_transformer import ProjHead
+from bam import BAMLoss, BamDistillLoss
 
-try:
-    from apex.optimizers import FusedLAMB
-    has_apex = True
-except ImportError:
-    has_apex = False
-
-custom_archs = ['vit_small', 'vit_base']
+from models.heads import MlpProjHead
+from models.wrappers import MultiCropWrapper, StudentTeacherWrapper
+from image_transforms import DataAugmentationDINO
+from online_evaluation import get_knn_loaders, distributed_knn
+from contrastive_croping.imagenet import ImageFolderCCrop, DataAugmentationCCrop
+from contrastive_croping.contrastive_crop import update_box
 
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('SOT', add_help=False)
+    parser = argparse.ArgumentParser('main_pretrain', add_help=False)
+
+    # Contrastive Crop parameters
+    parser.add_argument('--use_ccrop', type=utils.bool_flag, default=True,
+                        help=""" Enable Contrastive-Crop. """)
+    parser.add_argument('--box_thresh', type=float, default=0.1,
+                        help='Threshold of boxing. default: 0.1')
+    parser.add_argument('--loc_interval', type=int, default=20,
+                        help='Frequency of box update (in epochs). default: 20')
+    parser.add_argument('--ccrop_alpha', type=float, default=0.6,
+                        help='Contrastive crop alpha')
+    parser.add_argument('--ccrop_img_size', type=int, default=None,
+                        help='img size for ccrop dataloader. ')
 
     # Model parameters
     parser.add_argument('--arch', default='vit_small', type=str,
-                        choices=['vit_small', 'vit_base'] + utils.torchvision_archs,
                         help=""" Name of architecture to train. """)
-    parser.add_argument('--patch_size', default=16, type=int, help="""Size in pixels
-        of input square patches - default 16 (for 16x16 patches). Using smaller
-        values leads to better performance but requires more memory. If <16, we recommend disabling
-        mixed precision training (--use_fp16 false) to avoid instabilities.""")
+    parser.add_argument('--patch_size', default=16, type=int,
+                        help=""" Patch size for ViTs. """)
 
-    # Evaluation parameters
+    # KNN Evaluation parameters
     parser.add_argument('--knn_freq', default=0, type=int,
                         help=""" Run KNN evaluation every x epochs. """)
-    parser.add_argument('--eval_first', default=0, type=int,
-                        help=""" Run KNN evaluation before training. """)
     parser.add_argument('--knn_eval_fraction', default=1., type=float,
                         help=""" Randomly sample a (balanced) fraction of images from eval dataset. """)
     parser.add_argument('--knn_train_fraction', default=0.1, type=float,
                         help=""" Randomly sample a (balanced) fraction of images from train dataset. """)
-    # Loss parameters
-    parser.add_argument('--loss_fn', default='sot', type=str,
-                        help=""" Loss function to apply. """)
+    parser.add_argument('--eval_first', type=utils.bool_flag, default=False,
+                        help=""" Run KNN evaluation before training. """)
+
+    # BAM
     parser.add_argument('--reg', default=0.05, type=float,
                         help=""" Initial value of sinkhorn entropy regularization. """)
-    parser.add_argument('--reg_final', default=0.05, type=float,
+    parser.add_argument('--reg_final', default=None, type=float,
                         help=""" Final value of sinkhorn entropy regularization. """)
     parser.add_argument('--temperature', default=0.1, type=float,
                         help=""" Softmax (source distribution) temperature. """)
     parser.add_argument('--num_sink_iter', default=3, type=int,
                         help=""" Number of sinkhorn iterations. """)
+    parser.add_argument('--top_k_sink', default=0, type=int,
+                        help=""" Keep only the Top-K values of the Sinkhorn matrix. Set <= 0 to disable. """)
+    parser.add_argument('--top_p_sink', default=0., type=float,
+                        help=""" Keep only the Top-p values from the Sinkhorn matrix. Set <= 0 to disable. """)
+    parser.add_argument('--positive_masking', default=True, type=utils.bool_flag,
+                        help=""" Enable positive-masking for BAM loss. """)
+    parser.add_argument('--target_crops_number', default=None, type=int,
+                        help=""" How many target crops participate in the OT computation. """)
 
     # Projector parameters
     parser.add_argument('--hidden_dim', default=4096, type=int,
@@ -78,16 +78,35 @@ def get_args_parser():
     parser.add_argument('--out_dim', default=4096, type=int,
                         help=""" Dimensionality of the output layer in projector head. """)
     parser.add_argument('--n_layers', default=None, type=int,
-                        help=""" Number of layers in projection head. 
-                        By default we use 3 layers for Resnet backbone and 4 layers for ViT. """)
-    parser.add_argument('--use_bn_in_head', type=utils.bool_flag, default=True,
+                        help=""" Number of layers in projection head. """)
+    parser.add_argument('--proj_bias', default=True, type=utils.bool_flag,
+                        help=""" Using Bias in head. """)
+    parser.add_argument('--proj_act', default='gelu', type=str, choices=["relu", "gelu"],
+                        help=""" Activation function in head. """)
+    parser.add_argument('--proj_last_bn', type=utils.bool_flag, default=True,
+                        help=""" If to use batch normalization on projection head output. """)
+    parser.add_argument('--proj_use_bn', type=utils.bool_flag, default=True,
                         help=""" If to use batch normalization on projection head. """)
 
+    # Predictor parameters
+    parser.add_argument('--n_pred_layers', default=0, type=int,
+                        help=""" Number of layers in prediction head (if teacher is True). """)
+
+    # ViT parameters
+    parser.add_argument('--drop_path_rate', type=float, default=0.,
+                        help=""" Stochastic depth rate. """)
+    parser.add_argument('--qkv_bias', type=utils.bool_flag, default=True,
+                        help=""" Enable bias on qkv projection. """)
+
     # Training/Optimization parameters
+    parser.add_argument('--teacher', type=utils.bool_flag, default=False,
+                        help=""" Enable momentum teacher. """)
+    parser.add_argument('--teacher_m', type=float, default=0.995,
+                        help=""" Teacher momentum coefficient. """)
+
     parser.add_argument('--use_fp16', type=utils.bool_flag, default=True,
                         help=""" Enable Mixed-precision training. """)
-    parser.add_argument('--chunk_size', type=int, default=0)
-    parser.add_argument('--clip_grad', type=float, default=3.0)
+
     parser.add_argument('--batch_size_per_gpu', default=256, type=int)
     parser.add_argument('--epochs', default=100, type=int,
                         help=""" Number of training epochs. """)
@@ -97,23 +116,27 @@ def get_args_parser():
                         help=""" Highest learning rate used during training. """)
     parser.add_argument('--min_lr', type=float, default=1e-6,
                         help=""" Initial and final learning rate used during training. """)
+    parser.add_argument('--cos_factor', type=float, default=1.,
+                        help=""" Decrease factor for cosine scheduler. """)
     parser.add_argument('--optimizer', default='adamw', type=str,
                         choices=['adamw', 'sgd', 'lars', 'lamb'])
-    parser.add_argument('--drop_path_rate', type=float, default=0.1,
-                        help=""" Stochastic depth rate. """)
-    parser.add_argument('--attn_bias', type=utils.bool_flag, default=False)
     parser.add_argument('--weight_decay', type=float, default=0.04,
                         help=""" Initial value of the weight decay.
                         With ViT, a smaller value at the beginning of training works well. """)
     parser.add_argument('--weight_decay_end', type=float, default=0.4,
                         help=""" Final value of the weight decay.
                         using a larger decay by the end of training improves performance for ViTs. """)
+    parser.add_argument('--clip_grad', type=float, default=3.0)
+    parser.add_argument('--grad_checkpointing', type=int, default=0,
+                        help='Enable gradient checkpointing every n model functions.')
+    parser.add_argument('--compile', type=utils.bool_flag, default=True,
+                        help='Run with torch.compile().')
 
     # Multi-crop parameters
     parser.add_argument('--global_crops_number', type=int, default=2)
-    parser.add_argument('--local_crops_number', type=int, default=6)
-    parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.4, 1.))
-    parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.05, 0.4))
+    parser.add_argument('--local_crops_number', type=int, default=0)
+    parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.08, 1.))
+    parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.05, 0.25))
     parser.add_argument('--local_crops_size', type=int, default=96)
 
     # Misc
@@ -131,222 +154,300 @@ def get_args_parser():
                         help=""" Path to save logs and checkpoints. """)
     parser.add_argument('--saveckp_freq', default=20, type=int,
                         help=""" Save checkpoint every x epochs. """)
-    parser.add_argument('--seed', default=0, type=int,
-                        help=""" Random seed. """)
-    parser.add_argument('--num_workers', default=10, type=int,
-                        help=""" Number of data loading workers per GPU. """)
+    parser.add_argument('--seed', default=0, type=int, help=""" Random Seed. """)
+    parser.add_argument('--num_workers', default=10, type=int, help=""" Number of data loading workers per GPU. """)
     parser.add_argument("--dist_url", default="env://", type=str, help=""" Url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local-rank", default=0, type=int, help=""" Please ignore and do not set this argument. """)
     return parser
 
 
+def build_heads_from_args(args, is_teacher: bool = False):
+    # Projector
+    proj_head = MlpProjHead(input_dim=args.embed_dim, output_dim=args.out_dim,
+                            hidden_dim=args.hidden_dim, n_layers=args.n_layers,
+                            use_bn=args.proj_use_bn, last_bn=args.proj_last_bn,
+                            bias=args.proj_bias, activation=args.proj_act)
+    # Predictor
+    pred_head = None
+    pred_n_layers = args.n_pred_layers if (args.teacher and not is_teacher) else 0
+    if pred_n_layers > 0:
+        pred_head = MlpProjHead(input_dim=args.out_dim, output_dim=args.out_dim,
+                                hidden_dim=args.hidden_dim, n_layers=pred_n_layers,
+                                use_bn=args.proj_use_bn, last_bn=args.proj_last_bn,
+                                bias=args.proj_bias, activation=args.proj_act)
+    return [proj_head, pred_head]
+
+
+def get_ccrop_datasets_and_loaders(args):
+    # Dataloader for pretraining
+    transform_rcrop = DataAugmentationDINO(
+        args.global_crops_scale, args.local_crops_scale, args.local_crops_size, args.local_crops_number
+    )
+    transform_ccrop = DataAugmentationCCrop(
+        args.global_crops_scale, args.local_crops_scale, args.local_crops_size, args.local_crops_number,
+        alpha=args.ccrop_alpha,
+    )
+    train_dataset = ImageFolderCCrop(args.data_path, transform_rcrop=transform_rcrop, transform_ccrop=transform_ccrop)
+    train_sampler = torch.utils.data.DistributedSampler(train_dataset, shuffle=True)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, sampler=train_sampler, batch_size=args.batch_size_per_gpu,
+        num_workers=args.num_workers, shuffle=False, pin_memory=True, drop_last=True, )
+
+    # Dataloader for box update
+    ccrop_img_size = args.ccrop_img_size if args.ccrop_img_size is not None else 224
+    print("Contrastive crop image size:", ccrop_img_size)
+    transform_eval = transforms.Compose([
+        transforms.Resize((ccrop_img_size, ccrop_img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    eval_train_dataset = ImageFolder(args.data_path, transform=transform_eval)
+    eval_sampler = torch.utils.data.DistributedSampler(eval_train_dataset, shuffle=False)
+    eval_train_loader = torch.utils.data.DataLoader(eval_train_dataset, sampler=eval_sampler,
+                                                    batch_size=64, num_workers=args.num_workers,
+                                                    shuffle=False, pin_memory=True, drop_last=False, )
+    return train_dataset, train_loader, eval_train_loader
+
+
 def train(args):
     utils.init_distributed_mode(args)
     utils.setup_for_distributed(args.rank == 0)
-    utils.fix_random_seeds(args.seed)
+    utils.fix_random_seeds(args.seed + args.rank)
     utils.save_args_on_master(args)
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
+
+    args.world_size = utils.get_world_size()
     cudnn.benchmark = True
 
+    if args.target_crops_number is None:
+        args.target_crops_number = args.global_crops_number + args.local_crops_number
+
     # ============ preparing data ... ============
-    data_loader, dataset_size = utils.get_pretrain_loader(args)
+    if args.use_ccrop:  # load with contrastive-crop
+        train_set, data_loader, eval_train_loader = get_ccrop_datasets_and_loaders(args)
+        dataset_size = len(train_set)
+    else:
+        data_loader, dataset_size = utils.get_pretrain_loader(args)
+    print(f"Data loaded: there are {dataset_size} images.")
 
     # ============ building networks ... ============
-    model, embed_dim = utils.get_arch(args=args)
-    proj_head = ProjHead(
-        arch=args.arch,
-        input_dim=embed_dim,
-        n_layers=args.n_layers,
-        hidden_dim=args.hidden_dim,
-        output_dim=args.out_dim,
-        last_bn=args.use_bn_in_head
-    )
-
-    model = utils.MultiCropWrapper(model, proj_head)
+    model, embed_dim = utils.get_arch(args=args, num_classes=0)
+    args.embed_dim = embed_dim
+    if args.grad_checkpointing > 0:
+        model.set_grad_checkpointing(enable=True, every=args.grad_checkpointing)
+    model = MultiCropWrapper(model, *build_heads_from_args(args))
     model = model.cuda()
+    print("Number of parameters:",
+          sum(p.numel() for p in model.parameters() if p.requires_grad))
 
+    teacher, teacher_no_ddp = None, None
+    if args.teacher:
+        print("Initialize teacher model...")
+        teacher = utils.get_arch(args=args, num_classes=0)[0]
+        teacher = MultiCropWrapper(teacher, *build_heads_from_args(args, is_teacher=True))
+        teacher = teacher.cuda()
+
+    # synchronize batch norms (if any)
     if utils.has_batchnorms(model):
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)  # synchronize batch norms (if any)
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        if args.teacher:
+            teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
+            teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
+            teacher_without_ddp = teacher.module
+    elif args.teacher:
+        teacher_without_ddp = teacher
 
     model = nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-    print(f"Model is fully built with {args.arch} network.")
+    model_without_ddp = model.module
+
+    if args.compile:
+        print("Compiling model...")
+        model = torch.compile(model, mode='max-autotune')
+
+    if args.teacher:
+        momentum_scheduler = utils.cosine_scheduler(args.teacher_m, 1, args.epochs, len(data_loader))
+        model = StudentTeacherWrapper(model, teacher, momentum_scheduler)
+        model = model.cuda()
 
     # ============ preparing optimizer ... ============
-    params_groups = utils.get_params_groups(model)
+    params_groups = utils.get_params_groups(model_without_ddp)
 
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
-
     elif args.optimizer == "sgd":
         optimizer = torch.optim.SGD(params_groups, lr=0, momentum=0.9)  # lr is set by scheduler
-
     elif args.optimizer == "lars":
         optimizer = utils.LARS(params_groups)  # to use with convnet and large batches
-
-    elif args.optimizer == "lamb":
-        assert has_apex, "Error: LAMB requires Apex to be installed via: \n" \
-                         "pip install -v --no-cache-dir --global-option=--cpp_ext --global-option=--cuda_ext ./."
-        optimizer = FusedLAMB(params_groups)
-
     else:
         raise ValueError(f"Unknown optimizer: {args.optimizer}")
 
-    fp16_scaler = None
-    if args.use_fp16:
-        # mixed precision training
-        # fp16_scaler = torch.cuda.amp.GradScaler(init_scale=2.**12, growth_interval=500)
-        fp16_scaler = torch.cuda.amp.GradScaler()
-    else:
-        # full precision is faster with tf32
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    print(f"{args.arch} Model is fully built.")
+
+    # precision scaler
+    fp16_scaler = utils.AmpScalerWrapper(enable=args.use_fp16)
 
     # ============ init schedulers ... ============
-    args.world_size = utils.get_world_size()
-    lr_schedule = utils.cosine_scheduler(
-        args.lr * (args.batch_size_per_gpu * args.world_size) / 256.,  # linear scaling rule
-        args.min_lr,
-        args.epochs, len(data_loader),
-        warmup_epochs=args.warmup_epochs,
-    )
-    wd_schedule = utils.cosine_scheduler(
-        args.weight_decay,
-        args.weight_decay_end,
-        args.epochs, len(data_loader),
-    )
+    args.lr = args.lr * (args.batch_size_per_gpu * args.world_size) / 256.  # linear scaling rule for lr
+    args.num_steps = len(data_loader)
+
+    lr_schedule = utils.cosine_scheduler(args.lr, args.min_lr,
+                                         args.epochs, args.num_steps,
+                                         warmup_epochs=args.warmup_epochs,
+                                         decrease_factor=args.cos_factor)
+
+    wd_schedule = utils.cosine_scheduler(args.weight_decay, args.weight_decay_end,
+                                         args.epochs, args.num_steps)
 
     # ============ preparing loss ... ============
-    bam_loss = BAMLoss(args=args).cuda()
-    print(f"Loss, optimizer and schedulers ready.")
+    if not args.teacher:
+        loss_fn = BAMLoss.build_from_args(args)
+    else:
+        loss_fn = BamDistillLoss.build_from_args(args)  # Distillation loss
+    loss_fn = loss_fn.cuda()
+    print(loss_fn)
+
+    # wandb
+    utils.init_wandb(args=args, model=model, project="BAM-Pretraining", out_dir=args.output_dir)
 
     # ============ optionally resume training ... ============
-    to_restore = {"epoch": 0}
-    utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "checkpoint.pth"),
-        run_variables=to_restore,
-        model=model,
-        optimizer=optimizer,
-        fp16_scaler=fp16_scaler,
-    )
+    to_restore = {"epoch": 0, "boxes": None}
+    utils.restart_from_checkpoint(os.path.join(args.output_dir, "checkpoint.pth"),
+                                  model=model, optimizer=optimizer,
+                                  fp16_scaler=fp16_scaler, run_variables=to_restore)
     start_epoch = to_restore["epoch"]
+    if args.use_ccrop and start_epoch > args.warmup_epochs:
+        assert to_restore["boxes"] is not None
+        train_set.boxes = to_restore["boxes"]
 
-    # initialize wandb
-    utils.init_wandb(args=args, model=model, project="sot-imagenet", out_dir=args.output_dir)
+    # ============ preparing KNN dataloaders ============
+    knn_train_loader, knn_val_loader = get_knn_loaders(args)
 
-    # build KNN loaders
-    knn_train_loader, knn_val_loader = None, None
-    if args.knn_freq > 0:
-        print("\n\t-> Build dataloaders for KNN Evaluation...")
-        knn_train_loader, knn_val_loader = knn_loaders(args)
+    if args.eval_first:
+        top1, top5 = distributed_knn(model_without_ddp.backbone, args, knn_train_loader, knn_val_loader)
+        eval_dict = {'val/epoch': start_epoch-1, 'eval/KNN-Top-1': top1, 'eval/KNN-Top-5': top5}
+        print(f"\nKNN Evaluation results:\n\t-> Top-1: {top1:.4f}%, Top-5: {top5:.4f}%")
+        if args.teacher:
+            top1, top5 = distributed_knn(teacher_without_ddp.backbone, args, knn_train_loader, knn_val_loader)
+            eval_dict.update({'val/Teacher_KNN-Top-1': top1, 'val/Teacher_KNN-Top-5': top5})
+            print(f"\n(Teacher) KNN Evaluation results:\n\t-> Top-1: {top1:.4f}%, Top-5: {top5:.4f}%")
+        utils.log_dict(eval_dict)
 
-        if args.eval_first == 1:    # eval before training
-            top1, top5 = knn(model, args, knn_train_loader, knn_val_loader)
-            print(f"\nKNN Evaluation results:"
-                  f"\n\t-> Top-1: {top1:.4f}%, Top-5: {top5:.4f}")
-            utils.log_dict({'eval/eval_epoch': start_epoch - 1, 'eval/knn_top_1': top1, 'eval/knn_top_5': top5})
+    # ============ train ============
 
-    # training
+    # update boxes if we resumed from a checkpoint
+    if args.use_ccrop and start_epoch > args.loc_interval and (start_epoch - 1) % args.loc_interval == 0:
+        print("=>Update boxes from previous checkpoint (uses teacher network)...")
+        all_boxes = update_box(args.arch,
+                               eval_train_loader,
+                               teacher_without_ddp.backbone if args.teacher
+                               else model_without_ddp.backbone,
+                               dataset_size,
+                               block_idx=-1,
+                               t=args.box_thresh)
+        train_set.boxes = all_boxes.cpu()
+
     print("\nStart training !")
     start_time = time.time()
     for epoch in range(start_epoch, args.epochs):
         data_loader.sampler.set_epoch(epoch)
-        sot_loss.on_epoch_start(epoch)
+
+        # check ContrastiveCrop
+        train_set.use_box = args.use_ccrop and (epoch >= max(args.loc_interval, args.warmup_epochs) + 1)
 
         # ============ training one epoch ... ============
-        train_stats = train_one_epoch(model, sot_loss, data_loader, optimizer, lr_schedule, wd_schedule,
+
+        train_stats = train_one_epoch(model, loss_fn, data_loader, optimizer, lr_schedule, wd_schedule,
                                       epoch, fp16_scaler, args)
 
+        # ============ update bounding boxes ... ============
+
+        if args.use_ccrop and epoch >= args.warmup_epochs and \
+                epoch != (args.epochs - 1) and epoch % args.loc_interval == 0:
+            # all_boxes: tensor (len_ds, 4); (h_min, w_min, h_max, w_max)
+            all_boxes = update_box(args.arch,
+                                   eval_train_loader,
+                                   teacher_no_ddp.backbone if args.teacher
+                                   else model_without_ddp.backbone,
+                                   dataset_size,
+                                   block_idx=-1,
+                                   t=args.box_thresh)
+            # on_cuda=True
+            assert len(all_boxes) == dataset_size
+            train_set.boxes = all_boxes.cpu()
+
         # ============ writing logs ... ============
-        save_dict = {
+
+        ckpt_dict = {
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'epoch': epoch + 1,
             'args': args,
-            'sot_loss': sot_loss.state_dict(),
         }
+        if args.use_ccrop:
+            ckpt_dict['boxes'] = train_set.boxes
         if fp16_scaler is not None:
-            save_dict['fp16_scaler'] = fp16_scaler.state_dict()
+            ckpt_dict['fp16_scaler'] = fp16_scaler.state_dict()
 
-        save_checkpoint(save_dict, stats=train_stats, epoch=epoch)
+        save_checkpoint(ckpt_dict, stats=train_stats, epoch=epoch)
 
         # ============ KNN ============
-        if args.knn_freq > 0 and (epoch + 1) % args.knn_freq == 0:
-            top1, top5 = knn(model, args, knn_train_loader, knn_val_loader)
-            print(f"\nKNN Evaluation results:"
-                  f"\n\t-> Top-1: {top1:.4f}%, Top-5: {top5:.4f}%")
-            utils.log_dict({'eval/eval_epoch': epoch, 'eval/knn_top_1': top1, 'eval/knn_top_5': top5})
+
+        if args.knn_freq > 0 and ((epoch + 1) % args.knn_freq == 0 or epoch == args.epochs - 1):
+            top1, top5 = distributed_knn(model_without_ddp.backbone, args, knn_train_loader, knn_val_loader)
+            print(f"\nKNN Evaluation results:\n\t-> Top-1: {top1:.4f}%, Top-5: {top5:.4f}%")
+            eval_dict = {'val/epoch': epoch, 'eval/KNN-Top-1': top1, 'eval/KNN-Top-5': top5}
+            if args.teacher:
+                top1, top5 = distributed_knn(teacher_no_ddp.backbone, args, knn_train_loader, knn_val_loader)
+                eval_dict.update({'val/Teacher_KNN-Top-1': top1, 'val/Teacher_KNN-Top-5': top5})
+                print(f"\n(Teacher) KNN Evaluation results:\n\t-> Top-1: {top1:.4f}%, Top-5: {top5:.4f}%")
+            utils.log_dict(eval_dict)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
 
 
-def train_one_epoch(model, sot_loss, data_loader, optimizer, lr_schedule, wd_schedule, epoch, fp16_scaler, args):
-
+def train_one_epoch(model, loss_fn, data_loader, optimizer, lr_schedule, wd_schedule, epoch, fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
+    n_train_steps = len(data_loader)
 
     model.train()
     for it, (images, targets) in enumerate(metric_logger.log_every(data_loader, 100, header=header)):
-
-        it = len(data_loader) * epoch + it  # global training iteration
-
-        for i, param_group in enumerate(optimizer.param_groups):
-            param_group["lr"] = lr_schedule[it]
-            if i == 0:  # only the first group is regularized
-                param_group["weight_decay"] = wd_schedule[it]
+        # update schedulers
+        lr, wd = utils.update_lr_and_wd(optimizer, lr_schedule, wd_schedule, n_train_steps * epoch + it)
 
         images = [im.cuda(non_blocking=True) for im in images]
+        with torch.cuda.amp.autocast(enabled=fp16_scaler.scaler is not None):
+            if args.teacher:
+                z_source, z_target = model(images)
+            else:
+                z_source = model(images)
+                z_target = None
 
-        optimizer.zero_grad()
-        # with torch.cuda.amp.autocast(enabled=fp16_scaler is not None, dtype=torch.bfloat16):
-        with torch.cuda.amp.autocast(enabled=fp16_scaler is not None):
-            z = model(images, "train")
-            loss, _ = sot_loss(z)
+            loss = loss_fn(z_source, z_target, epoch=epoch)
 
-        if not math.isfinite(loss.item()):
-            print("Loss is {}, stopping training".format(loss.item()), force=True)
-            sys.exit(1)
-
-        grad_scale = 1. if fp16_scaler is None else fp16_scaler.get_scale()
-        param_norms = None
-        if fp16_scaler is None:
-            loss.backward()
-            if args.clip_grad:
-                param_norms = utils.clip_gradients(model, args.clip_grad)
-
-            utils.cancel_gradients_last_layer(epoch, model, 3)
-
-            optimizer.step()
+        # optimization step
+        if args.clip_grad:
+            fp16_scaler(optimizer=optimizer, loss=loss, clip_grad=args.clip_grad,
+                        parameters=model.parameters())
         else:
-            fp16_scaler.scale(loss).backward()
-            if args.clip_grad:
-                fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
-                param_norms = utils.clip_gradients(model, args.clip_grad)
+            fp16_scaler(optimizer=optimizer, loss=loss)
 
-            utils.cancel_gradients_last_layer(epoch, model, 3)
-
-            fp16_scaler.step(optimizer)
-            fp16_scaler.update()
-
-        # logging
         torch.cuda.synchronize()
-        metric_logger.update(loss=loss.item())
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
-        utils.log_dict({
-            "global/lr": lr_schedule[it],
-            "global/grad_scaling": grad_scale,
-            "train_aug_loss": loss.item(),
-        })
+
+        metric_logger.update(loss=loss.detach().item(), lr=lr, wd=wd)
+        utils.log_dict({"global/lr": lr, "train/loss_step": loss.detach().item()})
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
 
-    output_dict = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-    utils.log_dict(output_dict)
+    output_dict = {"train/" + k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    output_dict.update({"train/epoch": epoch})
+    utils.log_dict(output_dict)  # log epoch-level
+
     return output_dict
 
 
@@ -354,6 +455,7 @@ def save_checkpoint(save_dict, stats, epoch):
     """
     Save checkpoint
     """
+
     utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
     if args.saveckp_freq and epoch % args.saveckp_freq == 0:
         utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
@@ -365,7 +467,6 @@ def save_checkpoint(save_dict, stats, epoch):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('SOT', parents=[get_args_parser()])
-    args = parser.parse_args()
+    args = argparse.ArgumentParser('main_pretrain', parents=[get_args_parser()]).parse_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     train(args)

@@ -1,1 +1,1 @@
-from bam.bam_loss import BAMLoss
+from bam.bam_loss import BAMLoss, BamDistillLoss

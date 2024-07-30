@@ -26,92 +26,67 @@ import random
 import datetime
 import warnings
 from collections import defaultdict, deque
+from functools import partial
 
 import diffdist
 import wandb
-from PIL import Image
 import numpy as np
 import torch
 from torch import nn
 import torch.distributed as dist
-from PIL import ImageFilter, ImageOps
-from torchvision import datasets, transforms
-from torchvision import models as torchvision_models
-import vision_transformer as vits
+from torchvision import datasets
 
-torchvision_archs = sorted(name for name in torchvision_models.__dict__ if name.islower() and not name.startswith("__")
-                           and callable(torchvision_models.__dict__[name]))
+from timm import models as timm_models
+from timm.models.metaformer import StarReLU
 
-
-class ReturnIndexDataset(datasets.ImageFolder):
-    def __getitem__(self, idx):
-        img, lab = super(ReturnIndexDataset, self).__getitem__(idx)
-        return img, lab
+from models import vit, metaformer
+from image_transforms import DataAugmentationDINO
 
 
-class GaussianBlur(object):
-    """
-    Apply Gaussian Blur to the PIL image.
-    """
+def get_arch(args, num_classes=0, linear: bool = False, **vit_kwargs):
+    # ViTs
+    if args.arch in vit.__dict__.keys():
+        use_dynamic_img_size = args.local_crops_number > 0 or \
+                               (args.ccrop_img_size is not None and args.ccrop_img_size != 224)
 
-    def __init__(self, p=0.5, radius_min=0.1, radius_max=2.):
-        self.prob = p
-        self.radius_min = radius_min
-        self.radius_max = radius_max
-
-    def __call__(self, img):
-        do_it = random.random() <= self.prob
-        if not do_it:
-            return img
-
-        return img.filter(
-            ImageFilter.GaussianBlur(
-                radius=random.uniform(self.radius_min, self.radius_max)
-            )
-        )
-
-
-class Solarization(object):
-    """
-    Apply Solarization to the PIL image.
-    """
-
-    def __init__(self, p):
-        self.p = p
-
-    def __call__(self, img):
-        if random.random() < self.p:
-            return ImageOps.solarize(img)
-        else:
-            return img
-
-
-def get_arch(args, linear: bool = False, num_classes=0):
-
-    """
-    Load architecture
-    """
-
-    args.arch = args.arch.replace("deit", "vit")
-    if args.arch in vits.__dict__.keys():
-        model = vits.__dict__[args.arch](
+        model = vit.__dict__[args.arch](
+            weight_init='moco',
+            num_classes=num_classes,
+            qkv_bias=args.qkv_bias,
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path_rate,
-            num_classes=num_classes,
+            dynamic_img_size=use_dynamic_img_size,
+            global_pool='token',
             use_fc_norm=args.use_fc_norm if num_classes > 0 else None,
+            **vit_kwargs,
         )
-        embed_dim = model.embed_dim
+        output_dim = model.embed_dim if num_classes == 0 else num_classes
         if linear:
-            embed_dim = model.embed_dim * (args.n_last_blocks + int(args.avgpool_patchtokens))
+            output_dim = model.embed_dim * (args.n_last_blocks + int(args.avgpool_patchtokens))
+
+    # CAFormer
+    elif 'caformer' in args.arch:
+        # act = partial(StarReLU, inplace=True)
+        act = nn.GELU   # GELU is faster
+        model = metaformer.__dict__[args.arch](
+            num_classes=num_classes,
+            mlp_act=act,
+            act1_layer=act,
+            res_scale_init_values=(None, None, None, None),
+        )
+        output_dim = model.num_features
 
     # otherwise, we check if the architecture is in torchvision models
-    elif args.arch in torchvision_models.__dict__.keys():
-        model = torchvision_models.__dict__[args.arch]()
-        embed_dim = model.fc.weight.shape[1]
-        model.fc = nn.Identity()
+    elif args.arch in timm_models.__dict__.keys():
+        model = timm_models.__dict__[args.arch](
+            num_classes=num_classes
+        )
+        output_dim = model.num_features
+
     else:
         raise ValueError(f"Unknown architecture: {args.arch}")
-    return model, embed_dim
+
+    return model, output_dim
 
 
 def load_pretrained_weights_semi(model: nn.Module, pretrained_weights, checkpoint_key, model_name, patch_size):
@@ -138,11 +113,12 @@ def load_pretrained_weights_semi(model: nn.Module, pretrained_weights, checkpoin
         raise ValueError("Pretrained weights file not exist in: ", pretrained_weights)
 
 
-def load_pretrained_weights(model, pretrained_weights, checkpoint_key, model_name, patch_size):
+def load_pretrained_weights(model, pretrained_weights, checkpoint_key='model', take_teacher=True):
     if os.path.isfile(pretrained_weights):
         state_dict = torch.load(pretrained_weights, map_location="cpu")
+        print(state_dict.keys())
         if checkpoint_key is not None and checkpoint_key in state_dict:
-            print(f"Take key {checkpoint_key} in provided checkpoint dict")
+            print(f"Take key - '{checkpoint_key}' in provided checkpoint dict")
             state_dict = state_dict[checkpoint_key]
 
         # remove `module.` prefix
@@ -150,6 +126,12 @@ def load_pretrained_weights(model, pretrained_weights, checkpoint_key, model_nam
         state_dict = {k.replace("backbone.", ""): v for k, v in state_dict.items()}
         state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
         state_dict = {k.replace("base_encoder.", ""): v for k, v in state_dict.items()}
+
+        if take_teacher:
+            state_dict = {k.replace("teacher.", ""): v for k, v in state_dict.items()}
+        else:
+            state_dict = {k.replace("student.", ""): v for k, v in state_dict.items()}
+
         msg = model.load_state_dict(state_dict, strict=False)
         print('Pretrained weights found at {} and loaded with msg: {}'.format(pretrained_weights, msg))
     else:
@@ -161,6 +143,18 @@ def load_pretrained_weights(model, pretrained_weights, checkpoint_key, model_nam
 def clip_gradients(model, clip):
     norms = []
     for name, p in model.named_parameters():
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(2)
+            norms.append(param_norm.item())
+            clip_coef = clip / (param_norm + 1e-6)
+            if clip_coef < 1:
+                p.grad.data.mul_(clip_coef)
+    return norms
+
+
+def clip_gradients_from_named_parameters(named_parameters, clip):
+    norms = []
+    for name, p in named_parameters:
         if p.grad is not None:
             param_norm = p.grad.data.norm(2)
             norms.append(param_norm.item())
@@ -213,16 +207,23 @@ def restart_from_checkpoint(ckp_path, run_variables=None, **kwargs):
                 run_variables[var_name] = checkpoint[var_name]
 
 
-def cosine_scheduler(base_value, final_value, epochs, niter_per_ep, warmup_epochs=0, start_warmup_value=0):
-    warmup_schedule = np.array([])
+def cosine_scheduler(base_value, final_value, epochs, niter_per_ep,
+                     warmup_epochs=0, start_warmup_value=0, decrease_factor=1.):
     warmup_iters = warmup_epochs * niter_per_ep
     if warmup_epochs > 0:
         warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_iters)
+    else:
+        warmup_schedule = np.array([])
 
-    iters = np.arange(epochs * niter_per_ep - warmup_iters)
-    schedule = final_value + 0.5 * (base_value - final_value) * (1 + np.cos(np.pi * iters / len(iters)))
+    iters = np.arange(epochs * niter_per_ep - warmup_iters) * decrease_factor
+    iters = iters / len(iters)
+    iters[iters > 1] = 1
 
+    cosine_part = 0.5 * (base_value - final_value) * (1 + np.cos(np.pi * iters))
+
+    schedule = final_value + cosine_part
     schedule = np.concatenate((warmup_schedule, schedule))
+
     assert len(schedule) == epochs * niter_per_ep
     return schedule
 
@@ -248,6 +249,7 @@ def fix_random_seeds(seed=31):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
+    random.seed(seed)
 
 
 class SmoothedValue(object):
@@ -310,33 +312,6 @@ class SmoothedValue(object):
             global_avg=self.global_avg,
             max=self.max,
             value=self.value)
-
-
-def reduce_dict(input_dict, average=True):
-    """
-    Args:
-        input_dict (dict): all the values will be reduced
-        average (bool): whether to do average or sum
-    Reduce the values in the dictionary from all processes so that all processes
-    have the averaged results. Returns a dict with the same fields as
-    input_dict, after reduction.
-    """
-    world_size = get_world_size()
-    if world_size < 2:
-        return input_dict
-    with torch.no_grad():
-        names = []
-        values = []
-        # sort the keys so that they are consistent across processes
-        for k in sorted(input_dict.keys()):
-            names.append(k)
-            values.append(input_dict[k])
-        values = torch.stack(values, dim=0)
-        dist.all_reduce(values)
-        if average:
-            values /= world_size
-        reduced_dict = {k: v for k, v in zip(names, values)}
-    return reduced_dict
 
 
 class MetricLogger(object):
@@ -488,41 +463,27 @@ def setup_for_distributed(is_master):
 
 
 def init_distributed_mode(args):
-    args.is_slurm_job = "SLURM_JOB_ID" in os.environ
-
-    if ('SLURM_PROCID' in os.environ or args.is_slurm_job) and args.debug is False:
-        args.rank = int(os.environ['SLURM_PROCID'])
-        args.gpu = args.rank % torch.cuda.device_count()
-        args.world_size = int(os.environ["SLURM_NNODES"]) * int(os.environ["SLURM_TASKS_PER_NODE"][0])
-        print(f'Initialize SLURM job, rank {args.rank}, gpu {args.gpu}, world size {args.world_size}. ')
-
-    # launched with torch.distributed.launch
-    elif 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ['WORLD_SIZE'])
         args.gpu = int(os.environ['LOCAL_RANK'])
-
-    # launched naively with `python main_dino.py`
-    # we manually add MASTER_ADDR and MASTER_PORT to env variables
-    elif torch.cuda.is_available():
-        print('Will run the code on one GPU.')
-        args.rank, args.gpu, args.world_size = 0, 0, 1
-        os.environ['MASTER_ADDR'] = '127.0.0.1'
-        os.environ['MASTER_PORT'] = '29500'
+    elif 'SLURM_PROCID' in os.environ:
+        args.rank = int(os.environ['SLURM_PROCID'])
+        args.gpu = args.rank % torch.cuda.device_count()
     else:
-        print('Does not support training without GPU.')
-        sys.exit(1)
+        print('Not using distributed mode')
+        args.distributed = False
+        return
 
-    dist.init_process_group(
-        backend="nccl",
-        init_method=args.dist_url,
-        world_size=args.world_size,
-        rank=args.rank,
-    )
+    args.distributed = True
 
     torch.cuda.set_device(args.gpu)
-    print('| distributed init (rank {}, gpu {}): {}'.format(args.rank, args.gpu, args.dist_url), flush=True)
-    dist.barrier()
+    args.dist_backend = 'nccl'
+    print('| distributed init (rank {}): {}'.format(
+        args.rank, args.dist_url), flush=True)
+    torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                         world_size=args.world_size, rank=args.rank)
+    torch.distributed.barrier()
 
 
 def accuracy(output, target, topk=(1,)):
@@ -618,23 +579,11 @@ class LARS(torch.optim.Optimizer):
                 p.add_(mu, alpha=-g['lr'])
 
 
-def cosine_similarity_loss(predicted, target):
-    cosine_sim = nn.functional.cosine_similarity(predicted, target)
-    return 1 - cosine_sim.mean()
-
-
-class CrossEntropy(nn.Module):
-    def forward(self, prob_q, prob_p):
-        return -torch.sum(prob_p * torch.log(prob_q + 1e-5), dim=-1).mean()
-
-
-def all_gather_and_sort(z: torch.Tensor, num_crops: int) -> torch.Tensor:
-
+def all_gather_and_sort(z: torch.Tensor, n_crops: int) -> torch.Tensor:
     """
     Do a gather over all embeddings, so we can compute the loss.
     Final shape is like: (batch_size * num_gpus) x embedding_dim
     """
-
     if dist.is_available() and dist.is_initialized():
         world_size = get_world_size()
         z_list = [torch.zeros_like(z) for _ in range(world_size)]
@@ -643,13 +592,12 @@ def all_gather_and_sort(z: torch.Tensor, num_crops: int) -> torch.Tensor:
         # dist.all_gather(z_list, z)
         z_list = diffdist.functional.all_gather(z_list, z)
         # split it into [<proc0_aug0>, <proc0_aug1>, ..., <proc0_aug(m-1)>, <proc1_aug(m-1)>, ...]
-        z_list = [chunk for x in z_list for chunk in x.chunk(num_crops)]
+        z_list = [chunk for x in z_list for chunk in x.chunk(n_crops)]
         # will be sorted as crop_1 from all gpus, crop_2 from all gpus ...
         z_sorted = []
-        for m in range(num_crops):
+        for m in range(n_crops):
             for i in range(world_size):
-                z_sorted.append(z_list[i * num_crops + m])
-
+                z_sorted.append(z_list[i * n_crops + m])
         z_gathered = torch.cat(z_sorted, dim=0)
     else:
         z_gathered = z
@@ -659,72 +607,14 @@ def all_gather_and_sort(z: torch.Tensor, num_crops: int) -> torch.Tensor:
 
 @torch.no_grad()
 def concat_all_gather(tensor):
-
     """
     Performs all_gather operation on the provided tensors.
     *** Warning ***: torch.distributed.all_gather has no gradient.
     """
-
-    tensors_gather = [torch.ones_like(tensor)
-                      for _ in range(torch.distributed.get_world_size())]
+    tensors_gather = [torch.ones_like(tensor) for _ in range(torch.distributed.get_world_size())]
     torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
-
     output = torch.cat(tensors_gather, dim=0)
     return output
-
-
-class MultiCropWrapper(nn.Module):
-
-    """
-    Perform forward pass separately on each resolution input.
-    The inputs corresponding to a single resolution are clubbed and single
-    forward is run on the same resolution inputs. Hence we do several
-    forward passes = number of different resolutions used. We then
-    concatenate all the output features and run the head forward on these
-    concatenated features.
-    """
-
-    def __init__(self, backbone, proj_head):
-        super(MultiCropWrapper, self).__init__()
-        # disable layers dedicated to ImageNet labels classification
-        backbone.fc, backbone.head = nn.Identity(), nn.Identity()
-        self.backbone = backbone
-        self.proj_head = proj_head
-
-    def forward(self, x, withhead: bool = True, **kwargs):
-        # convert to list
-        if not isinstance(x, list):
-            x = [x]
-
-        idx_crops = torch.cumsum(torch.unique_consecutive(torch.tensor([inp.shape[-1] for inp in x]),
-                                                          return_counts=True, )[1], 0)
-
-        start_idx, output = 0, torch.empty(0).to(x[0].device)
-        for i, end_idx in enumerate(idx_crops):
-            _out = self.backbone(torch.cat(x[start_idx: end_idx]), **kwargs)
-
-            # The output is a tuple with XCiT model. See:
-            # https://github.com/facebookresearch/xcit/blob/master/xcit.py#L404-L405
-            if isinstance(_out, tuple):
-                _out = _out[0]
-            # accumulate outputs
-            output = torch.cat((output, _out))
-            start_idx = end_idx
-
-        # Run the head forward on the concatenated features.
-        if withhead:
-            return self.proj_head(output)
-
-        return output
-
-    def forward_head(self, x: torch.Tensor, normalize=False):
-        if normalize:
-            return nn.functional.normalize(self.proj_head(x), dim=-1)
-
-        return self.proj_head(x)
-
-    def forward_predict(self, x: torch.Tensor):
-        return self.pred_head(x)
 
 
 def get_params_groups(model):
@@ -751,13 +641,9 @@ def has_batchnorms(model):
 
 def get_pretrain_loader(args):
 
-    """
-    Make pretraining dataloaders
-    """
-
     transform = DataAugmentationDINO(
         args.global_crops_scale, args.local_crops_scale, args.local_crops_size, args.local_crops_number,
-    )
+    )   # use the same augmentations as in DINO
 
     dataset = datasets.ImageFolder(args.data_path, transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
@@ -771,53 +657,7 @@ def get_pretrain_loader(args):
     )
     num_samples = len(dataset)
     print(f"Data loaded: there are {num_samples} images.")
-
     return data_loader, num_samples
-
-
-def knn_loaders(args, splits: list = None):
-
-    """
-    Make supervised classification dataloaders for evaluating knn
-    """
-
-    if args.knn_freq <= 0:
-        return None
-
-    if splits is None:
-        splits = ['train', 'val']
-
-    data_loader_train = None
-    if 'train' in splits:
-        transform = transforms.Compose([
-            transforms.Resize(256, interpolation=3),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        ])
-        dataset_train = datasets.ImageFolder(args.data_path, transform=transform)
-        sampler_train = torch.utils.data.DistributedSampler(dataset_train, shuffle=False)
-        data_loader_train = torch.utils.data.DataLoader(
-            dataset_train,
-            sampler=sampler_train,
-            batch_size=1000,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            drop_last=False,
-        )
-
-    data_loader_val = None
-    if 'val' in splits:
-        val_path = args.data_path.replace('train', 'val')
-        dataset_val = datasets.ImageFolder(val_path, transform=transform)
-        data_loader_val = torch.utils.data.DataLoader(
-            dataset_val,
-            batch_size=1000,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            drop_last=False,
-        )
-    return data_loader_train, data_loader_val
 
 
 def multi_scale(samples, model):
@@ -837,74 +677,24 @@ def multi_scale(samples, model):
     return v
 
 
-# taken from DINO repository
-class DataAugmentationDINO(object):
-    def __init__(self, global_crops_scale, local_crops_scale, local_crops_size, local_crops_number):
-        flip_and_color_jitter = transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomApply(
-                [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1)],
-                p=0.8
-            ),
-            transforms.RandomGrayscale(p=0.2),
-        ])
-        normalize = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        ])
-        # first global crop
-        self.global_transfo1 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
-            flip_and_color_jitter,
-            GaussianBlur(1.0),
-            normalize,
-        ])
-        # second global crop
-        self.global_transfo2 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
-            flip_and_color_jitter,
-            GaussianBlur(0.1),
-            Solarization(0.2),
-            normalize,
-        ])
-        # transformation for the local small crops
-        self.local_crops_number = local_crops_number
-        self.local_transfo = transforms.Compose([
-            transforms.RandomResizedCrop(local_crops_size, scale=local_crops_scale, interpolation=Image.BICUBIC),
-            flip_and_color_jitter,
-            GaussianBlur(p=0.5),
-            normalize,
-        ])
-        print(flip_and_color_jitter)
-        print(self.global_transfo1)
-        print(self.global_transfo2)
-        print(self.local_transfo)
-
-    def __call__(self, image):
-        crops = [self.global_transfo1(image), self.global_transfo2(image)]
-        for _ in range(self.local_crops_number):
-            crops.append(self.local_transfo(image))
-        return crops
-
-
-def init_wandb(args, exp_name=None, entity='danielsha', project='sot-imagenet-eval',
-               model=None, resume=True, out_dir=None):
-    if args.wandb and get_rank() == 0:
+def init_wandb(args, exp_name=None, project="BAM-Pretraining", model=None, resume=True, out_dir=None):
+    if args.wandb and get_rank() == 0:  # initialize on rank 0
         if exp_name is None:
-            # set name for the experiment
-            exp_name = f'arch{args.arch}_ep{args.epochs}_bs{args.batch_size_per_gpu}_gpus{get_world_size()}_lr{args.lr}_' \
-                       f'crops{args.global_crops_number + args.local_crops_number}_clip{args.clip_grad}'
+            # infer run name
+            exp_name = f'arch{args.arch}_ep{args.epochs}_bs{args.batch_size_per_gpu}_gpus{get_world_size()}' \
+                       f'_lr{args.lr}_crops{args.global_crops_number + args.local_crops_number}_clip{args.clip_grad}' \
+                       f'_top-k{args.top_k_sink}'
 
         if args.wandb_key != "":
             # force relogin
             wandb.login(key=args.wandb_key, force=True)
 
         # init
-        logger = wandb.init(entity=entity, project=project, name=exp_name, config=vars(args), resume=resume,
-                            dir=out_dir)
+        logger = wandb.init(
+            project=project, name=exp_name, config=vars(args), resume=resume, dir=out_dir)
+
         if model is not None:
-            # log gradients
-            logger.watch(model, log="gradients", log_freq=100)
+            logger.watch(model, log="gradients", log_freq=100)      # log gradients
 
         if wandb.run.resumed:
             print("Resuming from previous wandb run...")
@@ -921,3 +711,204 @@ def log_dict(inp_dict: dict, commit: bool = True, step: int = None):
         else:
             wandb.log(inp_dict, commit=commit, step=step)
     return
+
+
+class AmpScalerWrapper(nn.Module):
+    """ Torch Scaler Wrapper. For easier use """
+
+    def __init__(self, enable=True, dtype=torch.float16):
+        super().__init__()
+        self.scaler = torch.cuda.amp.GradScaler() if enable else None
+        self.dtype = dtype
+        if enable:
+            assert self.dtype in [None, torch.float16, torch.bfloat16], f"{self.dtype} is not a valid torch dtype"
+
+    def forward(self, loss, optimizer, parameters=None, clip_grad=0.):
+
+        if not math.isfinite(loss.item()):
+            print("Loss is {}, stopping training".format(loss.item()), force=True)
+            sys.exit(1)
+
+        optimizer.zero_grad()
+
+        if self.scaler is None:
+            loss.backward()
+            if clip_grad > 0.:
+                norm = torch.nn.utils.clip_grad_norm_(parameters, clip_grad)
+            optimizer.step()
+        else:
+            self.scaler.scale(loss).backward()
+            if clip_grad > 0.:
+                self.scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
+                norm = torch.nn.utils.clip_grad_norm_(parameters, clip_grad)
+
+            self.scaler.step(optimizer)
+            self.scaler.update()
+
+    def state_dict(self):
+        return self.scaler.state_dict() if self.scaler is not None else None
+
+    def load_state_dict(self, state_dict):
+        assert self.scaler is not None
+        self.scaler.load_state_dict(state_dict)
+
+
+class GatherLayer(torch.autograd.Function):
+    """
+    Gather tensors from all workers with support for backward propagation:
+    This implementation does not cut the gradients as torch.distributed.all_gather does.
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        output = [torch.zeros_like(x) for _ in range(dist.get_world_size())]
+        dist.all_gather(output, x)
+        return output
+
+    @staticmethod
+    def backward(ctx, *grads):
+        all_gradients = torch.stack(grads)
+        dist.all_reduce(all_gradients)
+        return all_gradients[dist.get_rank()]
+
+
+def compute_map(ranks, gnd, kappas=[]):
+    """
+    Computes the mAP for a given set of returned results.
+         Usage:
+           map = compute_map (ranks, gnd)
+                 computes mean average precsion (map) only
+           map, aps, pr, prs = compute_map (ranks, gnd, kappas)
+                 computes mean average precision (map), average precision (aps) for each query
+                 computes mean precision at kappas (pr), precision at kappas (prs) for each query
+         Notes:
+         1) ranks starts from 0, ranks.shape = db_size X #queries
+         2) The junk results (e.g., the query itself) should be declared in the gnd stuct array
+         3) If there are no positive images for some query, that query is excluded from the evaluation
+    """
+
+    map = 0.
+    nq = len(gnd) # number of queries
+    aps = np.zeros(nq)
+    pr = np.zeros(len(kappas))
+    prs = np.zeros((nq, len(kappas)))
+    nempty = 0
+
+    for i in np.arange(nq):
+        qgnd = np.array(gnd[i]['ok'])
+
+        # no positive images, skip from the average
+        if qgnd.shape[0] == 0:
+            aps[i] = float('nan')
+            prs[i, :] = float('nan')
+            nempty += 1
+            continue
+
+        try:
+            qgndj = np.array(gnd[i]['junk'])
+        except:
+            qgndj = np.empty(0)
+
+        # sorted positions of positive and junk images (0 based)
+        pos  = np.arange(ranks.shape[0])[np.in1d(ranks[:,i], qgnd)]
+        junk = np.arange(ranks.shape[0])[np.in1d(ranks[:,i], qgndj)]
+
+        k = 0;
+        ij = 0;
+        if len(junk):
+            # decrease positions of positives based on the number of
+            # junk images appearing before them
+            ip = 0
+            while (ip < len(pos)):
+                while (ij < len(junk) and pos[ip] > junk[ij]):
+                    k += 1
+                    ij += 1
+                pos[ip] = pos[ip] - k
+                ip += 1
+
+        # compute ap
+        ap = compute_ap(pos, len(qgnd))
+        map = map + ap
+        aps[i] = ap
+
+        # compute precision @ k
+        pos += 1 # get it to 1-based
+        for j in np.arange(len(kappas)):
+            kq = min(max(pos), kappas[j])
+            prs[i, j] = (pos <= kq).sum() / kq
+        pr = pr + prs[i, :]
+
+    map = map / (nq - nempty)
+    pr = pr / (nq - nempty)
+
+    return map, aps, pr, prs
+
+
+def compute_ap(ranks, nres):
+    """
+    Computes average precision for given ranked indexes.
+    Arguments
+    ---------
+    ranks : zerro-based ranks of positive images
+    nres  : number of positive images
+    Returns
+    -------
+    ap    : average precision
+    """
+
+    # number of images ranked by the system
+    nimgranks = len(ranks)
+
+    # accumulate trapezoids in PR-plot
+    ap = 0
+
+    recall_step = 1. / nres
+
+    for j in np.arange(nimgranks):
+        rank = ranks[j]
+
+        if rank == 0:
+            precision_0 = 1.
+        else:
+            precision_0 = float(j) / rank
+
+        precision_1 = float(j + 1) / (rank + 1)
+
+        ap += (precision_0 + precision_1) * recall_step / 2.
+
+    return ap
+
+
+def adjust_learning_rate(optimizer, epoch, args):
+    """Decays the learning rate with half-cycle cosine after warmup"""
+    if epoch < args.warmup_epochs:
+        lr = args.lr * epoch / args.warmup_epochs
+    else:
+        lr = args.lr * 0.5 * (1. + math.cos(math.pi * (epoch - args.warmup_epochs) / (args.epochs - args.warmup_epochs)))
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    return lr
+
+
+def adjust_moco_momentum(epoch, args, m=0.996):
+    """Adjust moco momentum based on current epoch"""
+    m_init = args.m if m is None else m
+    m = 1. - 0.5 * (1. + math.cos(math.pi * epoch / args.epochs)) * (1. - m_init)
+    return m
+
+
+def update_wd(optimizer, schedule, it):
+    wd = schedule[it]
+    for i, param_group in enumerate(optimizer.param_groups):
+        if i == 0:  # only the first group is regularized
+            param_group["weight_decay"] = wd
+    return wd
+
+
+def update_lr_and_wd(optimizer, lr_schedule, wd_schedule, it):
+    for i, param_group in enumerate(optimizer.param_groups):
+        param_group["lr"] = lr_schedule[it]
+        if i == 0:  # only the first group is regularized
+            param_group["weight_decay"] = wd_schedule[it]
+
+    return lr_schedule[it], wd_schedule[it]

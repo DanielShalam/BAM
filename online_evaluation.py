@@ -28,7 +28,7 @@ def temp_seed(seed):
 
 def get_subset_indices(args, targets, fraction, distributed_split, balanced, seed=0):
     """
-    split data among gpus
+    Split data among GPUs
     """
 
     if not fraction or fraction <= 0 or fraction >= 1:
@@ -74,10 +74,13 @@ def get_subset_indices(args, targets, fraction, distributed_split, balanced, see
                 return random_subset
 
 
-def knn_loaders(args, splits=None):
+def get_knn_loaders(args, splits=None):
     """
-    create loaders for knn evaluation
+    Create loaders for Online KNN
     """
+
+    if args.knn_freq <= 0:
+        return None, None
 
     if splits is None:
         splits = ['train', 'val']
@@ -91,114 +94,116 @@ def knn_loaders(args, splits=None):
     ])
 
     # train loader
-    loader_train = None
+    train_dataloader = None
     train_path = args.data_path if 'train' in args.data_path else os.path.join(args.data_path, 'train')
     if 'train' in splits:
-        dataset_train = datasets.ImageFolder(train_path, transform=eval_transform)
-        targets = torch.tensor(dataset_train.targets)
+        dataset = datasets.ImageFolder(train_path, transform=eval_transform)
+        targets = torch.tensor(dataset.targets)
         # sample and distribute random subsets
         print("Split train dataset to gpus")
         subset_indices = get_subset_indices(args, targets, args.knn_train_fraction,
                                             distributed_split=args.world_size > 1,
                                             balanced=True, seed=0)
         # mask subset loader
-        data_train = SubsetWithTargets(dataset_train, subset_indices, targets[subset_indices])
-        loader_train = torch.utils.data.DataLoader(
-            data_train, sampler=None, batch_size=args.batch_size_per_gpu, num_workers=8,
-            pin_memory=True, drop_last=False, shuffle=False,
+        dataset = SubsetWithTargets(dataset, subset_indices, targets[subset_indices])
+        train_dataloader = torch.utils.data.DataLoader(
+            dataset, sampler=None, batch_size=64, num_workers=8,
+            pin_memory=True, drop_last=True, shuffle=False,
         )
 
     # eval loader
-    loader_eval = None
+    eval_dataloader = None
     if 'val' in splits:
         val_path = train_path.replace('train', 'val')
-        dataset_eval = datasets.ImageFolder(val_path, transform=eval_transform)
+        dataset = datasets.ImageFolder(val_path, transform=eval_transform)
         if not args.knn_eval_fraction or args.knn_eval_fraction <= 0 or args.knn_eval_fraction >= 1:
-            loader_eval = torch.utils.data.DataLoader(
-                dataset_eval, batch_size=args.batch_size_per_gpu, num_workers=8, pin_memory=True, drop_last=False,
+            eval_dataloader = torch.utils.data.DataLoader(
+                dataset, batch_size=64, num_workers=8, pin_memory=True, drop_last=False,
             )
         else:
             # use subset
-            targets = torch.tensor(dataset_eval.targets)
+            targets = torch.tensor(dataset.targets)
             subset_indices = get_subset_indices(args, targets, fraction=args.knn_eval_fraction,
                                                 distributed_split=False, balanced=True, seed=0)
-            data_eval = SubsetWithTargets(dataset_eval, subset_indices, targets[subset_indices])
-            loader_eval = torch.utils.data.DataLoader(
-                data_eval, batch_size=args.batch_size_per_gpu, num_workers=8, pin_memory=True, drop_last=False,
+            dataset = SubsetWithTargets(dataset, subset_indices, targets[subset_indices])
+            eval_dataloader = torch.utils.data.DataLoader(
+                dataset, batch_size=64, num_workers=8, pin_memory=True, drop_last=False,
             )
 
-    return loader_train, loader_eval
+    return train_dataloader, eval_dataloader
 
 
 @torch.no_grad()
 def extract_features(model, loader):
     """
-    extract base features
+    Extract base encoder features
     """
 
     train_labels = torch.LongTensor(loader.dataset.targets)
-    print("num samples per gpu:", len(train_labels))
     n_samples_local = len(train_labels)
     n_batches = len(loader)
 
-    print(f"compute features...")
+    print(f"\n-> Compute Train Features...")
     train_features = None
     idx = 0
     total_time_start = time()
     for count, (images, targets) in enumerate(loader):
         images = images.cuda(non_blocking=True)
-        features = model(images, withhead=False)
+        features = model(images)
         batch_size, dim = features.size()
 
         if train_features is None:
             train_features = torch.empty((n_samples_local, dim), device=features.device)
 
-        if idx+batch_size > n_samples_local:
-            print("Size warning. final index:", idx+batch_size,
+        if idx + batch_size > n_samples_local:
+            print("Size Warning: final index:", idx + batch_size,
                   "is larger then the expected number of features:", n_samples_local)
 
-        train_features[idx: min(idx+batch_size, n_samples_local), :] = features
+        train_features[idx: min(idx + batch_size, n_samples_local), :] = features
         idx += batch_size
-        if (count+1) % 50 == 0:
-            print(f"{count + 1}/{n_batches}, time (sec): {time()-total_time_start:.4f}")
+        if (count + 1) % 50 == 0:
+            print(f"{count + 1}/{n_batches}, time (sec): {time() - total_time_start:.4f}")
 
     train_features = F.normalize(train_features, dim=-1)
     return train_features.t(), train_labels.view(1, -1).cuda(non_blocking=True)
 
 
 @torch.no_grad()
-def knn(model, args, train_loader=None, val_loader=None, k=20, T=0.07):
+def distributed_knn(model, args, train_loader=None, val_loader=None,
+                    k: int = 20, T: float = 0.07):
     """
-    distributed knn
+    Distributed knn
     """
 
-    print(f"Start {k}-KNN evaluation...")
-    model.eval()
-    # load datasets
+    print(f"\n-> Running {k}-KNN Evaluation...")
+
     temp_loaders = False
-    if train_loader is None or val_loader is None:
-        print("reloading data loaders...")
+    if train_loader is None or val_loader is None:  # make dataloaders if they are not given
+        print("\n-> Reloading Data loaders...")
         temp_loaders = True
-        train_loader, val_loader = knn_loaders(args)
+        train_loader, val_loader = get_knn_loaders(args)
 
-    # extract train features
-    train_features, train_targets = extract_features(model, train_loader)
-
-    # evaluate on validation images
+    # constants
     C = np.max(val_loader.dataset.targets) + 1
     retrieval_one_hot = torch.zeros(k, C).cuda(non_blocking=True)
     n_batches = len(val_loader)
     top1, top5, total = 0.0, 0.0, 0
 
+    was_train = model.training
+    model.eval()
+
+    # extract train features
+    train_features, train_targets = extract_features(model, train_loader)
+
     total_time_start = time()
-    print("Train features extracted. Evaluating... ")
+    print("\n\t-> Extracting Train features is Done. Start Evaluating... ")
     for idx, (images, targets) in enumerate(val_loader):
         images = images.cuda(non_blocking=True)
         targets = targets.cuda(non_blocking=True)
         batch_size = targets.shape[0]
 
         # forward + find k-most similar samples locally for each gpu
-        eval_feat = model(images, withhead=False)
+        eval_feat = model(images)
         eval_feat = F.normalize(eval_feat, p=2, dim=-1)
         top_local_sim, top_local_indexes = (eval_feat.mm(train_features)).topk(k, dim=-1, largest=True, sorted=True)
 
@@ -234,32 +239,14 @@ def knn(model, args, train_loader=None, val_loader=None, k=20, T=0.07):
         top5 = top5 + correct.narrow(1, 0, min(5, k)).sum().item()  # top5 does not make sense if k < 5
         total += batch_size
 
-        if (idx+1) % 50 == 0:
-            print(f"test {idx + 1}/{n_batches}\t",
-                  f"time: {time()-total_time_start}\t",
-                  f"top1: {top1 * 100.0 / total:.2f}\t",
-                  f"top5: {top5 * 100.0 / total:.2f}")
-
-    top1 = top1 * 100.0 / total
-    top5 = top5 * 100.0 / total
+        if (idx + 1) % 50 == 0:
+            print(f"\n\t-> Batch {idx + 1}/{n_batches}",
+                  f"\n\t-> Time: {time() - total_time_start}",
+                  f"\n\t-> Top-1: {top1 * 100.0 / total:.2f}",
+                  f"\n\t-> Top-5: {top5 * 100.0 / total:.2f}")
 
     if temp_loaders:
         del train_loader, val_loader
 
-    return top1, top5
-
-
-class Queue(object):
-    def __init__(self, fraction, world_size):
-        self._fraction = fraction
-        self.world_size = world_size
-        self.queue = torch.randn()
-
-    def synchronize_between_processes(self):
-        if self.world_size > 1:
-            gather_queue = self.queue.clone()
-            gather_list = [torch.empty_like(self.queue) for _ in range(self.world_size)]
-            dist.all_gather(gather_list, gather_queue)
-            return torch.cat(gather_queue)
-
-        return self.queue
+    model.train(was_train)
+    return top1 * 100.0 / total, top5 * 100.0 / total
