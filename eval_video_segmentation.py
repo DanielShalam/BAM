@@ -288,7 +288,7 @@ if __name__ == '__main__':
         model,
         args.pretrained_weights,
         checkpoint_key=args.checkpoint_key,
-        take_teacher=args.take_teacher,
+        take_teacher=args.use_teacher,
     )
 
     for param in model.parameters():

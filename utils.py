@@ -89,30 +89,6 @@ def get_arch(args, num_classes=0, linear: bool = False, **vit_kwargs):
     return model, output_dim
 
 
-def load_pretrained_weights_semi(model: nn.Module, pretrained_weights, checkpoint_key, model_name, patch_size):
-    if os.path.isfile(pretrained_weights):
-        model_state_dict = model.state_dict()
-        state_dict = torch.load(pretrained_weights, map_location="cpu")
-        if checkpoint_key is not None and checkpoint_key in state_dict:
-            print(f"Take key {checkpoint_key} in provided checkpoint dict")
-            state_dict = state_dict[checkpoint_key]
-
-        # remove `module.` prefix
-        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-        # remove `backbone.` prefix induced by multicrop wrapper
-        state_dict = {k.replace("backbone.", ""): v for k, v in state_dict.items()}
-
-        for k in ['head.weight', 'head.bias']:
-            if k in state_dict and state_dict[k].shape != model_state_dict[k].shape:
-                print(f"Removing key {k} from pretrained checkpoint")
-                del state_dict[k]
-
-        msg = model.load_state_dict(state_dict, strict=False)
-        print('Pretrained weights found at {} and loaded with msg: {}'.format(pretrained_weights, msg))
-    else:
-        raise ValueError("Pretrained weights file not exist in: ", pretrained_weights)
-
-
 def load_pretrained_weights(model, pretrained_weights, checkpoint_key='model', take_teacher=True):
     if os.path.isfile(pretrained_weights):
         state_dict = torch.load(pretrained_weights, map_location="cpu")

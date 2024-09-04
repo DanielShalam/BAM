@@ -58,15 +58,15 @@ def get_args_parser():
     parser.add_argument('--reg', default=0.05, type=float,
                         help=""" Initial value of sinkhorn entropy regularization. """)
     parser.add_argument('--reg_final', default=None, type=float,
-                        help=""" Final value of sinkhorn entropy regularization. """)
+                        help=""" Final value of sinkhorn entropy regularization. (default: --reg)""")
     parser.add_argument('--temperature', default=0.1, type=float,
                         help=""" Softmax (source distribution) temperature. """)
     parser.add_argument('--num_sink_iter', default=3, type=int,
                         help=""" Number of sinkhorn iterations. """)
     parser.add_argument('--top_k_sink', default=0, type=int,
-                        help=""" Keep only the Top-K values of the Sinkhorn matrix. Set <= 0 to disable. """)
+                        help=""" Keep only the Top-K values of the Sinkhorn matrix. set <= 0 to disable. """)
     parser.add_argument('--top_p_sink', default=0., type=float,
-                        help=""" Keep only the Top-p values from the Sinkhorn matrix. Set <= 0 to disable. """)
+                        help=""" Keep only the Top-p values from the Sinkhorn matrix. set <= 0 to disable. """)
     parser.add_argument('--positive_masking', default=True, type=utils.bool_flag,
                         help=""" Enable positive-masking for BAM loss. """)
     parser.add_argument('--target_crops_number', default=None, type=int,
@@ -77,20 +77,16 @@ def get_args_parser():
                         help=""" Dimensionality of the hidden layer in projector head. """)
     parser.add_argument('--out_dim', default=4096, type=int,
                         help=""" Dimensionality of the output layer in projector head. """)
-    parser.add_argument('--n_layers', default=None, type=int,
+    parser.add_argument('--n_layers', default=3, type=int,
                         help=""" Number of layers in projection head. """)
     parser.add_argument('--proj_bias', default=True, type=utils.bool_flag,
-                        help=""" Using Bias in head. """)
+                        help=""" Use bias in head. """)
     parser.add_argument('--proj_act', default='gelu', type=str, choices=["relu", "gelu"],
                         help=""" Activation function in head. """)
     parser.add_argument('--proj_last_bn', type=utils.bool_flag, default=True,
                         help=""" If to use batch normalization on projection head output. """)
     parser.add_argument('--proj_use_bn', type=utils.bool_flag, default=True,
                         help=""" If to use batch normalization on projection head. """)
-
-    # Predictor parameters
-    parser.add_argument('--n_pred_layers', default=0, type=int,
-                        help=""" Number of layers in prediction head (if teacher is True). """)
 
     # ViT parameters
     parser.add_argument('--drop_path_rate', type=float, default=0.,
@@ -116,8 +112,6 @@ def get_args_parser():
                         help=""" Highest learning rate used during training. """)
     parser.add_argument('--min_lr', type=float, default=1e-6,
                         help=""" Initial and final learning rate used during training. """)
-    parser.add_argument('--cos_factor', type=float, default=1.,
-                        help=""" Decrease factor for cosine scheduler. """)
     parser.add_argument('--optimizer', default='adamw', type=str,
                         choices=['adamw', 'sgd', 'lars', 'lamb'])
     parser.add_argument('--weight_decay', type=float, default=0.04,
@@ -129,7 +123,7 @@ def get_args_parser():
     parser.add_argument('--clip_grad', type=float, default=3.0)
     parser.add_argument('--grad_checkpointing', type=int, default=0,
                         help='Enable gradient checkpointing every n model functions.')
-    parser.add_argument('--compile', type=utils.bool_flag, default=True,
+    parser.add_argument('--compile', type=utils.bool_flag, default=False,
                         help='Run with torch.compile().')
 
     # Multi-crop parameters
@@ -162,25 +156,19 @@ def get_args_parser():
     return parser
 
 
-def build_heads_from_args(args, is_teacher: bool = False):
-    # Projector
-    proj_head = MlpProjHead(input_dim=args.embed_dim, output_dim=args.out_dim,
-                            hidden_dim=args.hidden_dim, n_layers=args.n_layers,
-                            use_bn=args.proj_use_bn, last_bn=args.proj_last_bn,
-                            bias=args.proj_bias, activation=args.proj_act)
-    # Predictor
-    pred_head = None
-    pred_n_layers = args.n_pred_layers if (args.teacher and not is_teacher) else 0
-    if pred_n_layers > 0:
-        pred_head = MlpProjHead(input_dim=args.out_dim, output_dim=args.out_dim,
-                                hidden_dim=args.hidden_dim, n_layers=pred_n_layers,
-                                use_bn=args.proj_use_bn, last_bn=args.proj_last_bn,
-                                bias=args.proj_bias, activation=args.proj_act)
-    return [proj_head, pred_head]
+def build_heads_from_args(args):
+    """ Build projector head.
+    """
+    proj_head = MlpProjHead(
+        input_dim=args.embed_dim, output_dim=args.out_dim, hidden_dim=args.hidden_dim, n_layers=args.n_layers,
+        use_bn=args.proj_use_bn, last_bn=args.proj_last_bn, bias=args.proj_bias, activation=args.proj_act
+    )
+    return proj_head
 
 
 def get_ccrop_datasets_and_loaders(args):
-    # Dataloader for pretraining
+    """ Build dataloaders with contrastive-crop if args.use_ccrop is set to True.
+    """
     transform_rcrop = DataAugmentationDINO(
         args.global_crops_scale, args.local_crops_scale, args.local_crops_size, args.local_crops_number
     )
@@ -221,10 +209,13 @@ def train(args):
     cudnn.benchmark = True
 
     if args.target_crops_number is None:
-        args.target_crops_number = args.global_crops_number + args.local_crops_number
+        # default number of target views is number of large views
+        args.target_crops_number = args.global_crops_number
 
     # ============ preparing data ... ============
-    if args.use_ccrop:  # load with contrastive-crop
+
+    if args.use_ccrop:
+        # load with contrastive-crop
         train_set, data_loader, eval_train_loader = get_ccrop_datasets_and_loaders(args)
         dataset_size = len(train_set)
     else:
@@ -232,11 +223,12 @@ def train(args):
     print(f"Data loaded: there are {dataset_size} images.")
 
     # ============ building networks ... ============
+
     model, embed_dim = utils.get_arch(args=args, num_classes=0)
     args.embed_dim = embed_dim
     if args.grad_checkpointing > 0:
         model.set_grad_checkpointing(enable=True, every=args.grad_checkpointing)
-    model = MultiCropWrapper(model, *build_heads_from_args(args))
+    model = MultiCropWrapper(model, build_heads_from_args(args))
     model = model.cuda()
     print("Number of parameters:",
           sum(p.numel() for p in model.parameters() if p.requires_grad))
@@ -245,7 +237,7 @@ def train(args):
     if args.teacher:
         print("Initialize teacher model...")
         teacher = utils.get_arch(args=args, num_classes=0)[0]
-        teacher = MultiCropWrapper(teacher, *build_heads_from_args(args, is_teacher=True))
+        teacher = MultiCropWrapper(teacher, build_heads_from_args(args))
         teacher = teacher.cuda()
 
     # synchronize batch norms (if any)
@@ -271,6 +263,7 @@ def train(args):
         model = model.cuda()
 
     # ============ preparing optimizer ... ============
+
     params_groups = utils.get_params_groups(model_without_ddp)
 
     if args.optimizer == "adamw":
@@ -288,18 +281,18 @@ def train(args):
     fp16_scaler = utils.AmpScalerWrapper(enable=args.use_fp16)
 
     # ============ init schedulers ... ============
+
     args.lr = args.lr * (args.batch_size_per_gpu * args.world_size) / 256.  # linear scaling rule for lr
     args.num_steps = len(data_loader)
 
-    lr_schedule = utils.cosine_scheduler(args.lr, args.min_lr,
-                                         args.epochs, args.num_steps,
-                                         warmup_epochs=args.warmup_epochs,
-                                         decrease_factor=args.cos_factor)
+    lr_schedule = utils.cosine_scheduler(
+        args.lr, args.min_lr, args.epochs, args.num_steps, warmup_epochs=args.warmup_epochs)
 
-    wd_schedule = utils.cosine_scheduler(args.weight_decay, args.weight_decay_end,
-                                         args.epochs, args.num_steps)
+    wd_schedule = utils.cosine_scheduler(
+        args.weight_decay, args.weight_decay_end, args.epochs, args.num_steps)
 
     # ============ preparing loss ... ============
+
     if not args.teacher:
         loss_fn = BAMLoss.build_from_args(args)
     else:
@@ -311,6 +304,7 @@ def train(args):
     utils.init_wandb(args=args, model=model, project="BAM-Pretraining", out_dir=args.output_dir)
 
     # ============ optionally resume training ... ============
+
     to_restore = {"epoch": 0, "boxes": None}
     utils.restart_from_checkpoint(os.path.join(args.output_dir, "checkpoint.pth"),
                                   model=model, optimizer=optimizer,
@@ -321,6 +315,7 @@ def train(args):
         train_set.boxes = to_restore["boxes"]
 
     # ============ preparing KNN dataloaders ============
+
     knn_train_loader, knn_val_loader = get_knn_loaders(args)
 
     if args.eval_first:
@@ -365,13 +360,13 @@ def train(args):
         if args.use_ccrop and epoch >= args.warmup_epochs and \
                 epoch != (args.epochs - 1) and epoch % args.loc_interval == 0:
             # all_boxes: tensor (len_ds, 4); (h_min, w_min, h_max, w_max)
-            all_boxes = update_box(args.arch,
-                                   eval_train_loader,
-                                   teacher_no_ddp.backbone if args.teacher
-                                   else model_without_ddp.backbone,
-                                   dataset_size,
-                                   block_idx=-1,
-                                   t=args.box_thresh)
+            all_boxes = update_box(
+                args.arch, eval_train_loader,
+                teacher_no_ddp.backbone if args.teacher
+                else model_without_ddp.backbone,
+                dataset_size, block_idx=-1,
+                t=args.box_thresh
+            )
             # on_cuda=True
             assert len(all_boxes) == dataset_size
             train_set.boxes = all_boxes.cpu()

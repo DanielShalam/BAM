@@ -13,7 +13,17 @@ from bam.masks import get_positive_mask, get_top_k_mask, get_top_p_mask
 
 class BAMLoss(nn.Module):
     """
-    Balanced-Attention Matching Loss
+    Balanced-Attention Matching Loss.
+
+    :param n_crops: total number of views.
+    :param n_lrg_crops: number of large (global) views.
+    :param n_tgt_crops: number of target views (defaults to n_lrg_crops).
+    :param ot_reg_scheduler: a scheduler for the OT regularization (defaults to constant scheduler).
+    :param softmax_temperature: the temperature of the source attention.
+    :param num_sinkhorn_iters: number of sinkhorn iterations.
+    :param top_p: if >0., we keep only the highest values for the target matrix, according to the top_p masking.
+    :param top_k: if >0., we keep only the highest values for the target matrix, according to the top_k masking.
+    :param positive_masking: if to apply positive-masking (defaults to True).
     """
 
     def __init__(self,
@@ -92,7 +102,7 @@ class BAMLoss(nn.Module):
         batch_size_per_crop = Q.size(0) // self.n_crops
 
         # positive-masking
-        if self.pos_mask is None:   # make positive mask
+        if self.pos_mask is None:   # compute the positive mask only once
             if self.positive_masking:
                 self.pos_mask = get_positive_mask(batch_size_per_crop, n_crops=self.n_crops).detach()
             else:
@@ -133,12 +143,11 @@ class BAMLoss(nn.Module):
         self.ot_reg = self.ot_reg_scheduler[epoch] if epoch is not None else self.ot_reg[-1]
         bs_per_crop = z.size(0) // self.n_crops
 
+        # l2-normalize + gather targets from gpus
         z = F.normalize(z, dim=-1)
         z_gathered = F.normalize(z_teacher, dim=-1) if z_teacher is not None else z
-        z_gathered = gather_sort_tensors(
-            z_gathered[:bs_per_crop * self.n_tgt_crops],
-            n_crops=self.n_tgt_crops,
-        )
+        z_gathered = gather_sort_tensors(z_gathered[:bs_per_crop * self.n_tgt_crops], n_crops=self.n_tgt_crops)
+
         loss = self.compute_loss(Q=z @ z_gathered.t())
         return loss
 
@@ -161,6 +170,9 @@ class BAMLoss(nn.Module):
 
 
 class BamDistillLoss(BAMLoss):
+    """
+    Distill the Balanced-Attention matrix from a target network (e.g. momentum network or a pretrained one).
+    """
 
     def compute_loss(self, Q: torch.Tensor, Q_tgt: torch.Tensor):
         """
@@ -210,13 +222,14 @@ class BamDistillLoss(BAMLoss):
         self.ot_reg = self.ot_reg_scheduler[epoch] if epoch is not None else self.ot_reg[-1]
         bs_per_crop = z.size(0) // self.n_crops
 
+        # l2-normalize + gather targets from gpus
         z = F.normalize(z, dim=-1)
         z_teacher = F.normalize(z_teacher, dim=-1)
-        z_teacher_gathered = gather_sort_tensors(
-            z_teacher[:bs_per_crop * self.n_tgt_crops],
-            n_crops=self.n_tgt_crops,
-        )
-        loss = self.compute_loss(Q=z @ z_teacher_gathered.t(), Q_tgt=z_teacher @ z_teacher_gathered.t())
+        z_teacher_gathered = gather_sort_tensors(z_teacher[:bs_per_crop * self.n_tgt_crops], n_crops=self.n_tgt_crops)
+
+        loss = self.compute_loss(
+            Q=z @ z_teacher_gathered.t(),
+            Q_tgt=z_teacher @ z_teacher_gathered.t())
         return loss
 
     @staticmethod
