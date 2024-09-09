@@ -68,7 +68,8 @@ def get_args_parser():
     parser.add_argument('--positive_masking', default=True, type=utils.bool_flag,
                         help=""" Enable positive-masking for BAM loss. """)
     parser.add_argument('--target_crops_number', default=None, type=int,
-                        help=""" How many target crops participate in the OT computation. """)
+                        help=""" How many target crops participate in the OT computation.
+                         (default: global_crops_number)""")
 
     # Projector parameters
     parser.add_argument('--hidden_dim', default=4096, type=int,
