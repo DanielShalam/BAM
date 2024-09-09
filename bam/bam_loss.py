@@ -8,7 +8,7 @@ import torch.distributed as dist
 from torch import FloatTensor
 import numpy as np
 
-from bam.masks import get_positive_mask, get_top_k_mask, get_top_p_mask
+from bam.masks import get_positive_mask
 
 
 class BAMLoss(nn.Module):
@@ -21,7 +21,6 @@ class BAMLoss(nn.Module):
     :param ot_reg_scheduler: a scheduler for the OT regularization (defaults to constant scheduler).
     :param softmax_temperature: the temperature of the source attention.
     :param num_sinkhorn_iters: number of sinkhorn iterations.
-    :param top_p: if >0., we keep only the highest values for the target matrix, according to the top_p masking.
     :param top_k: if >0., we keep only the highest values for the target matrix, according to the top_k masking.
     :param positive_masking: if to apply positive-masking (defaults to True).
     """
@@ -33,7 +32,6 @@ class BAMLoss(nn.Module):
                  ot_reg_scheduler: np.ndarray,
                  softmax_temperature: float = 0.1,
                  num_sinkhorn_iters: int = 3,
-                 top_p: float = 0.,
                  top_k: int = 0,
                  positive_masking: bool = True):
         super().__init__()
@@ -45,30 +43,21 @@ class BAMLoss(nn.Module):
         self.softmax_temperature = softmax_temperature
         self.num_sinkhorn_iters = num_sinkhorn_iters
         self.positive_masking = positive_masking
+        self.top_k = top_k      # top-k masking
 
-        # TOP-K/P Masking
-        self.top_k = top_k
-        self.top_p = top_p
-        self.masking_fn = None
-        if self.top_k > 0:
-            self.masking_fn = partial(get_top_k_mask, k=self.top_k, inverse=True)
-        elif self.top_p > 0:
-            self.masking_fn = partial(get_top_p_mask, is_distribution=True, threshold=self.top_p, inverse=True)
-
-        print(f"BAM Loss initialized. ", f"\n\t-> OT Temperature:      {ot_reg_scheduler}, "
-                                         f"\n\t-> Softmax Temperature: {softmax_temperature},"
-                                         f"\n\t-> Num Sinkhorn iters:  {num_sinkhorn_iters},"
-                                         f"\n\t-> Top k:               {self.top_k},"
-                                         f"\n\t-> Top p:               {self.top_p},")
+        print(f"BAM Loss initialized. ",
+              f"\n\t-> OT Temperature:      {ot_reg_scheduler}, "
+              f"\n\t-> Softmax Temperature: {softmax_temperature},"
+              f"\n\t-> Num Sinkhorn iters:  {num_sinkhorn_iters},"
+              f"\n\t-> Top k:               {self.top_k},"
+              )
         self.pos_mask = None
         self._log_softmax = nn.LogSoftmax(dim=-1)
 
     @torch.no_grad()
     def _sinkhorn(self, Q: FloatTensor):
+        """ Sinkhorn
         """
-        Sinkhorn
-        """
-
         n, N = Q.size()
         assignments = (Q / self.ot_reg)
         if self.positive_masking:
@@ -83,20 +72,23 @@ class BAMLoss(nn.Module):
             Q=torch.exp(assignments).t(),
             world_size=dist.get_world_size(),
             num_sink_iter=self.num_sinkhorn_iters,
-            n_masked=self.n_tgt_crops if self.positive_masking else 0,
+            n_masked=self.n_tgt_crops if self.positive_masking else 0
         )
 
-    def keep_top_values(self, logits: FloatTensor, n_crops: int, mask_value: float = 0.):
-        assert self.masking_fn is not None
-        # compute the average similarity matrix over the large crops
-        num_mask = logits.size(-1) - self.top_k
-        avg_logits = torch.stack(logits.chunk(n_crops, dim=0)).mean(0)
-        logits.scatter_(-1, (-avg_logits).topk(num_mask, dim=-1).indices.repeat(n_crops, 1), mask_value)
-        return logits
+    def keep_top_values(self, logits, n_crops: int):
+        """ Compute the top-k values over the average of all target distributions,
+            and mask all but the top-k indices on each view.
+        """
+        avg_logits = torch.stack(logits.chunk(n_crops, dim=0)).mean(0)  # average view logits
+        topk_indices = avg_logits.topk(self.top_k, dim=-1)
+        topk_indices = topk_indices.indices.repeat(n_crops, 1)   # repeat indices for each crop
+
+        logits_masked = torch.zeros_like(logits)
+        logits_masked.scatter_(-1, topk_indices, logits.gather(-1, topk_indices))
+        return logits_masked
 
     def compute_loss(self, Q: FloatTensor):
-        """
-        Compute BAM Loss
+        """ Compute the Balanced Self-Attention loss.
         """
         num_large_crops = self.n_lrg_crops
         batch_size_per_crop = Q.size(0) // self.n_crops
@@ -111,9 +103,9 @@ class BAMLoss(nn.Module):
 
         # self-sinkhorn
         with torch.no_grad():
-            P = self._sinkhorn(Q.detach())[:batch_size_per_crop * num_large_crops]  # use only large crops as target
+            P = self._sinkhorn(Q.detach())[:batch_size_per_crop*num_large_crops]  # use only large crops as target
             if self.masking_fn is not None:
-                P = self.keep_top_values(P, n_crops=num_large_crops, mask_value=0.)
+                P = self.keep_top_values(P, n_crops=num_large_crops)
                 P = P / P.sum(dim=-1, keepdim=True)
             P = P.chunk(num_large_crops)
 
@@ -123,7 +115,7 @@ class BAMLoss(nn.Module):
             Q.masked_fill_(self.pos_mask, torch.finfo(Q.dtype).min)
         log_Q = self._log_softmax(Q).chunk(self.n_crops)
 
-        loss_pos_mask = (~self.pos_mask[: batch_size_per_crop]).to(log_Q[0].dtype)
+        loss_pos_mask = (~self.pos_mask[:batch_size_per_crop]).to(log_Q[0].dtype)
 
         # accumulate loss
         loss = 0.
@@ -143,7 +135,7 @@ class BAMLoss(nn.Module):
         self.ot_reg = self.ot_reg_scheduler[epoch] if epoch is not None else self.ot_reg[-1]
         bs_per_crop = z.size(0) // self.n_crops
 
-        # l2-normalize + gather targets from gpus
+        # l2-normalize & gather target features from gpus
         z = F.normalize(z, dim=-1)
         z_gathered = F.normalize(z_teacher, dim=-1) if z_teacher is not None else z
         z_gathered = gather_sort_tensors(z_gathered[:bs_per_crop * self.n_tgt_crops], n_crops=self.n_tgt_crops)
@@ -163,13 +155,12 @@ class BAMLoss(nn.Module):
                        n_crops=args.local_crops_number + args.global_crops_number,
                        n_tgt_crops=args.target_crops_number,
                        top_k=args.top_k_sink,
-                       top_p=args.top_p_sink,
                        ot_reg=ot_reg_scheduler,
                        softmax_temperature=args.temperature,
                        positive_masking=args.positive_masking, )
 
 
-class BamDistillLoss(BAMLoss):
+class DistillBAMLoss(BAMLoss):
     """
     Distill the Balanced-Attention matrix from a target network (e.g. momentum network or a pretrained one).
     """
@@ -193,7 +184,7 @@ class BamDistillLoss(BAMLoss):
         with torch.no_grad():
             P = self._sinkhorn(Q_tgt.detach())[:batch_size_per_crop * num_large_crops]  # use only large crops as target
             if self.masking_fn is not None:
-                P = self.keep_top_values(P, n_crops=num_large_crops, mask_value=0.)
+                P = self.keep_top_values(P, n_crops=num_large_crops)
                 P = P / P.sum(dim=-1, keepdim=True)
             P = P.chunk(num_large_crops)
 
@@ -240,11 +231,10 @@ class BamDistillLoss(BAMLoss):
             np.linspace(args.reg, ot_reg_final, reg_warmup_epochs),
             np.ones(args.epochs - reg_warmup_epochs) * ot_reg_final
         ))
-        return BamDistillLoss(n_lrg_crops=args.global_crops_number,
+        return DistillBAMLoss(n_lrg_crops=args.global_crops_number,
                               n_crops=args.local_crops_number + args.global_crops_number,
                               n_tgt_crops=args.target_crops_number,
                               top_k=args.top_k_sink,
-                              top_p=args.top_p_sink,
                               ot_reg_scheduler=ot_reg_scheduler,
                               softmax_temperature=args.temperature,
                               positive_masking=args.positive_masking, )

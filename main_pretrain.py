@@ -13,7 +13,7 @@ from torchvision.datasets import ImageFolder
 from torchvision.transforms import transforms
 
 import utils
-from bam import BAMLoss, BamDistillLoss
+from bam import BAMLoss, DistillBAMLoss
 
 from models.heads import MlpProjHead
 from models.wrappers import MultiCropWrapper, StudentTeacherWrapper
@@ -65,8 +65,6 @@ def get_args_parser():
                         help=""" Number of sinkhorn iterations. """)
     parser.add_argument('--top_k_sink', default=0, type=int,
                         help=""" Keep only the Top-K values of the Sinkhorn matrix. set <= 0 to disable. """)
-    parser.add_argument('--top_p_sink', default=0., type=float,
-                        help=""" Keep only the Top-p values from the Sinkhorn matrix. set <= 0 to disable. """)
     parser.add_argument('--positive_masking', default=True, type=utils.bool_flag,
                         help=""" Enable positive-masking for BAM loss. """)
     parser.add_argument('--target_crops_number', default=None, type=int,
@@ -296,7 +294,7 @@ def train(args):
     if not args.teacher:
         loss_fn = BAMLoss.build_from_args(args)
     else:
-        loss_fn = BamDistillLoss.build_from_args(args)  # Distillation loss
+        loss_fn = DistillBAMLoss.build_from_args(args)  # Distillation loss
     loss_fn = loss_fn.cuda()
     print(loss_fn)
 
