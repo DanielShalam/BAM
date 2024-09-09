@@ -224,6 +224,7 @@ def train(args):
 
     model, embed_dim = utils.get_arch(args=args, num_classes=0)
     args.embed_dim = embed_dim
+    # enable gradient checkpointing
     if args.grad_checkpointing > 0:
         model.set_grad_checkpointing(enable=True, every=args.grad_checkpointing)
     model = MultiCropWrapper(model, build_heads_from_args(args))
