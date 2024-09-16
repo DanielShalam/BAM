@@ -7,7 +7,7 @@ Many leading self-supervised methods for unsupervised representation learning, i
 
 ## Pretrained models
 
-You can choose to download only the weights of the pretrained backbone used for downstream tasks, or the full checkpoint which contains backbone and projection head weights for both student and teacher networks.
+We provide the pretrained weights for some of our best configurations -
 
 | arch          | params                 | linear        | download      |
 | ------------- |-------------           | ------------- | ------------- |
@@ -18,15 +18,27 @@ You can choose to download only the weights of the pretrained backbone used for 
 
 We provide the script for pretraining our BAM models under different configurations. All scripts can be found under the "scripts" directory.
 
+### BAM specific hyperparameters -
+
+    --reg 0.05                   # Entropy regularization for the Sinkhorn algorithm (used for target pairwise attention). smaller value -> smaller entropy.
+    --temperature 0.1            # Temperature for the Softmax attention. smaller value -> smaller entropy.
+    --num_sink_iter 3            # Number of Sinkhorn iterations. 
+    --top_k_sink 0               # We found that using only the top-k values (e.g. 128) of the target attention can slightly improve linear accuracy. This parameter does not mentioned in the paper.
+    --positive_masking True      # Use positive masking. We usually set this to True.
+    --target_crops_number 2      # Use this amount of views for creating the target attention matrix. We use the same number of large crops.
+
 ## Online evaluation
 
 We monitor BAM pretraining using a K-NN classifier. For faster evaluation, we use 10% of imagenet training data. The implementation support distributed machines.
 You can define the evaluation configuration using the following arguments -
 
-    --knn_freq 20 # evaluate every 20 epochs 
-    --knn_train_fraction 0.1 # use 10% of training data 
-    --knn_eval_fraction # use 100% of validation data
+    --knn_freq 20                # evaluate every 20 epochs 
+    --knn_train_fraction 0.1     # use 10% of training data 
+    --knn_eval_fraction 1.       # use 100% of validation data
 
+## Linear probing
+
+Scripts for running linear head on top of forzen BAM backbone can be found under the "scripts" directory.
 
 ## Citation
 
