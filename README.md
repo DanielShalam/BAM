@@ -18,6 +18,16 @@ You can choose to download only the weights of the pretrained backbone used for 
 
 We provide the script for pretraining our BAM models under different configurations. All scripts can be found under the "scripts" directory.
 
+## Online evaluation
+
+We monitor BAM pretraining using a K-NN classifier. For faster evaluation, we use 10% of imagenet training data. The implementation support distributed machines.
+You can define the evaluation configuration using the following arguments -
+
+    --knn_freq 20 # evaluate every 20 epochs 
+    --knn_train_fraction 0.1 # use 10% of training data 
+    --knn_eval_fraction # use 100% of validation data
+
+
 ## Citation
 
 <p>
