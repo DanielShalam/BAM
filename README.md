@@ -11,10 +11,10 @@ We provide the pretrained weights for some of our best configurations -
 
 | arch          | params                 | linear        | download      |
 | ------------- |-------------           | ------------- | ------------- |
-| ViT-B/16      | 85M                    | 78.1          | --            |
-| CAFormer-M36  | 57M                    | 78.9          | --            |
+| ViT-B/16      | 85M                    | 78.1          | soon          |
+| CAFormer-M36  | 57M                    | 78.9          | soon          |
 
-## Training
+## BAM Pretraining
 
 We provide the script for pretraining our BAM models under different configurations. All scripts can be found under the "scripts" directory.
 
@@ -38,7 +38,7 @@ You can define the evaluation configuration using the following arguments -
 
 ## Linear probing
 
-Scripts for running linear head on top of forzen BAM backbone can be found under the "scripts" directory.
+Scripts for running linear head on top of forzen BAM backbone can be found under "scripts" directory.
 
 ## Citation
 
