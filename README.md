@@ -12,7 +12,7 @@ We provide the pretrained weights for some of our best configurations -
 | arch          | params                 | linear        | download      |
 | ------------- |-------------           | ------------- | ------------- |
 | ViT-B/16      | 85M                    | 78.1          | soon          |
-| CAFormer-M36  | 57M                    | 78.9          | soon          |
+| CAFormer-M36  | 57M                    | 79.3          | soon          |
 
 ## BAM Pretraining
 
