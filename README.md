@@ -7,12 +7,13 @@ Many leading self-supervised methods for unsupervised representation learning, i
 
 ## Pretrained models
 
-We provide the pretrained weights for some of our best configurations -
+We provide the pretrained weights for some of our best models.
+Each file include imagenet-1k pretrained weights, training logs and linear classification head. 
 
 | arch          | params                 | linear        | download      |
 | ------------- |-------------           | ------------- | ------------- |
-| ViT-B/16      | 85M                    | 78.1          | soon          |
-| CAFormer-M36  | 57M                    | 79.3          | soon          |
+| ViT-B/16      | 85M                    | 78.1          | [pretrained+linear](https://drive.google.com/file/d/1wjh_EBQPYYHFjqoqlKCitcG9mjgkWFRw/view?usp=drive_link)          |
+| CAFormer-M36  | 57M                    | 79.3          | [pretrained+linear](https://drive.google.com/file/d/1K97duDiP703ePk400A6YhUvkR3RIBGwV/view?usp=drive_link)          |
 
 ## BAM Pretraining
 
